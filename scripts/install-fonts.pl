@@ -8,6 +8,7 @@ use File::Copy qw(copy);
 use File::Path qw(make_path remove_tree);
 use File::Spec;
 use Getopt::Long qw(GetOptions);
+use IO::Uncompress::Unzip qw($UnzipError);
 
 my $config = '';
 my $output = '';
@@ -212,13 +213,7 @@ sub prepare_archive {
     print "Extracting $archive_name\n";
 
     if ($font->{archive_type} eq 'zip') {
-        run_command(
-            'unzip',
-            '-q',
-            $archive_path,
-            '-d',
-            $extract_dir,
-        );
+        extract_zip_archive($archive_path, $extract_dir);
     } elsif ($font->{archive_type} eq 'tar.gz') {
         run_command(
             'tar',
@@ -240,6 +235,46 @@ sub prepare_archive {
     }
 
     return $extract_dir;
+}
+
+sub extract_zip_archive {
+    my ($archive_path, $extract_dir) = @_;
+
+    my $zip = IO::Uncompress::Unzip->new($archive_path)
+        or die "failed to open zip archive '$archive_path': $UnzipError\n";
+
+    while (1) {
+        my $header = $zip->getHeaderInfo();
+        my $name = normalize_path($header->{Name} // '');
+        die "unsafe zip entry path '$name' in $archive_path\n"
+            if $name eq ''
+            || $name =~ m{^/}
+            || grep { $_ eq '..' } split m{/}, $name;
+
+        my $destination = File::Spec->catfile($extract_dir, split m{/}, $name);
+
+        if ($name =~ m{/\z}) {
+            make_path($destination);
+        } else {
+            make_path(dirname($destination));
+            open my $out, '>', $destination
+                or die "open $destination: $!\n";
+            binmode $out;
+
+            my $buffer = '';
+            while (1) {
+                my $read = $zip->read($buffer);
+                die "failed to read zip entry '$name': $UnzipError\n"
+                    if !defined $read || $read < 0;
+                last if $read == 0;
+                print {$out} $buffer;
+            }
+
+            close $out or die "close $destination: $!\n";
+        }
+
+        last if !$zip->nextStream();
+    }
 }
 
 sub install_font {
