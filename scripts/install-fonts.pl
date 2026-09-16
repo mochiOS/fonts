@@ -192,49 +192,76 @@ sub prepare_archive {
         sanitize_name($font->{family} . '-' . $font->{version}),
     );
 
-    if (!-f $archive_path) {
-        print "Downloading $font->{family} $font->{version}\n";
+    for my $attempt (1 .. 2) {
+        download_file_atomic(
+            path => $archive_path,
+            url  => $font->{url},
+            curl => $curl_command,
+            label => "$font->{family} $font->{version}",
+        ) if !-f $archive_path;
 
+        remove_tree($extract_dir) if -d $extract_dir;
+        make_path($extract_dir);
+
+        print "Extracting $archive_name\n";
+
+        my $extracted = eval {
+            if ($font->{archive_type} eq 'zip') {
+                extract_zip_archive($archive_path, $extract_dir);
+            } elsif ($font->{archive_type} eq 'tar.gz') {
+                run_command('tar', '-xzf', $archive_path, '-C', $extract_dir);
+            } elsif ($font->{archive_type} eq 'tar.xz') {
+                run_command('tar', '-xJf', $archive_path, '-C', $extract_dir);
+            } else {
+                die "unsupported archive type '$font->{archive_type}'\n";
+            }
+            1;
+        };
+
+        return $extract_dir if $extracted;
+
+        my $error = $@ || "archive extraction failed\n";
+        remove_tree($extract_dir) if -d $extract_dir;
+        die $error if $attempt == 2;
+
+        warn "Discarding invalid cached archive '$archive_path': $error";
+        unlink $archive_path
+            or die "failed to remove invalid archive '$archive_path': $!\n";
+    }
+
+    die "failed to prepare archive '$archive_path'\n";
+}
+
+sub download_file_atomic {
+    my (%args) = @_;
+    my $path = $args{path};
+    my $temporary = "$path.part.$$";
+
+    unlink $temporary if -e $temporary;
+    print "Downloading $args{label}\n";
+
+    my $downloaded = eval {
         run_command(
-            $curl_command,
+            $args{curl},
             '--fail',
             '--location',
             '--retry',
             '3',
             '--output',
-            $archive_path,
-            $font->{url},
+            $temporary,
+            $args{url},
         );
+        1;
+    };
+
+    if (!$downloaded) {
+        my $error = $@ || "download failed\n";
+        unlink $temporary if -e $temporary;
+        die $error;
     }
 
-    remove_tree($extract_dir) if -d $extract_dir;
-    make_path($extract_dir);
-
-    print "Extracting $archive_name\n";
-
-    if ($font->{archive_type} eq 'zip') {
-        extract_zip_archive($archive_path, $extract_dir);
-    } elsif ($font->{archive_type} eq 'tar.gz') {
-        run_command(
-            'tar',
-            '-xzf',
-            $archive_path,
-            '-C',
-            $extract_dir,
-        );
-    } elsif ($font->{archive_type} eq 'tar.xz') {
-        run_command(
-            'tar',
-            '-xJf',
-            $archive_path,
-            '-C',
-            $extract_dir,
-        );
-    } else {
-        die "unsupported archive type '$font->{archive_type}'\n";
-    }
-
-    return $extract_dir;
+    rename $temporary, $path
+        or die "failed to publish download '$path': $!\n";
 }
 
 sub extract_zip_archive {
@@ -331,17 +358,11 @@ sub install_license {
         );
 
         if (!-f $cached_license) {
-            print "Downloading license for $font->{family} $font->{version}\n";
-
-            run_command(
-                $curl_command,
-                '--fail',
-                '--location',
-                '--retry',
-                '3',
-                '--output',
-                $cached_license,
-                $font->{license_path},
+            download_file_atomic(
+                path => $cached_license,
+                url => $font->{license_path},
+                curl => $curl_command,
+                label => "license for $font->{family} $font->{version}",
             );
         }
 
