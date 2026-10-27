@@ -1,0 +1,13 @@
+[package]
+name = "mochios-fonts"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Shared font catalogue and per-user font management for mochiOS"
+
+[dependencies]
+ttf-parser = "0.25.1"
+sha2 = "0.10"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("mochios"))'] }
