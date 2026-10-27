@@ -4,6 +4,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -13,6 +14,81 @@ const MAX_FILES: usize = 1024;
 const MAX_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 static LOCAL_REVISION: AtomicU64 = AtomicU64::new(0);
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
+
+/// A validated, disabled preview copy. It is excluded from font discovery and
+/// removed when its last owner closes it. File-backed aliases also work when
+/// the Linux desktop renders the application's display list in another process.
+#[derive(Clone, Debug)]
+pub struct FontPreview {
+    pub file: FontFile,
+    pub source: PathBuf,
+    lease: Arc<PreviewLease>,
+}
+#[derive(Debug)]
+struct PreviewLease(PathBuf);
+impl Drop for PreviewLease {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+impl FontPreview {
+    pub fn open(locations: &Locations, source: &Path) -> io::Result<Self> {
+        Self::from_bytes(locations, source, &read_font(source)?)
+    }
+    pub fn from_bytes(locations: &Locations, source: &Path, bytes: &[u8]) -> io::Result<Self> {
+        let faces = inspect(bytes)?;
+        let root = user_root(locations, true)?.join(".previews");
+        match fs::create_dir(&root) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+        if !fs::symlink_metadata(&root)?.is_dir() {
+            return Err(invalid("Font preview storage must be a real directory."));
+        }
+        let mut total = bytes.len() as u64;
+        let mut count = 1;
+        for entry in fs::read_dir(&root)?.take(1024) {
+            total = total.saturating_add(entry?.metadata()?.len());
+            count += 1;
+        }
+        if count > 8 || total > 128 * 1024 * 1024 {
+            return Err(invalid(
+                "Font preview storage limit reached. Close other font previews.",
+            ));
+        }
+        let path = temp_path(&root, "document").with_extension("ttf.disabled");
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        let lease = Arc::new(PreviewLease(path.clone()));
+        output.write_all(bytes)?;
+        output.sync_all()?;
+        let path = fs::canonicalize(path)?;
+        Ok(Self {
+            file: FontFile {
+                path,
+                digest: digest(bytes),
+                scope: Scope::User,
+                enabled: false,
+                bytes: bytes.len() as u64,
+                faces,
+                managed: false,
+            },
+            source: source.to_owned(),
+            lease,
+        })
+    }
+    /// Installs precisely the bytes shown by this preview, never a reopened source.
+    pub fn install(&self, locations: &Locations) -> io::Result<FontFile> {
+        let data = read_font(&self.lease.0)?;
+        if digest(&data) != self.file.digest {
+            return Err(invalid("Font preview changed. Open the file again."));
+        }
+        install_data(locations, &data)
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Scope {
@@ -262,6 +338,12 @@ pub fn catalogue(locations: &Locations) -> Catalogue {
                     .collect::<Vec<_>>();
                 entries.sort();
                 for entry in entries {
+                    if scope == Scope::User
+                        && depth == 0
+                        && entry.file_name().is_some_and(|name| name == ".previews")
+                    {
+                        continue;
+                    }
                     walk(&entry, scope, depth + 1, paths, warnings, remaining);
                     if paths.len() >= MAX_FILES || *remaining == 0 {
                         break;
@@ -416,6 +498,9 @@ fn validate_target(locations: &Locations, file: &FontFile) -> io::Result<PathBuf
 }
 pub fn install(locations: &Locations, source: &Path) -> io::Result<FontFile> {
     let data = read_font(source)?;
+    install_data(locations, &data)
+}
+fn install_data(locations: &Locations, data: &[u8]) -> io::Result<FontFile> {
     let faces = inspect(&data)?;
     let hash = digest(&data);
     let root = user_root(locations, true)?;
@@ -630,6 +715,56 @@ mod tests {
             let _ = fs::remove_dir_all(&self.root);
         }
     }
+    #[test]
+    fn document_preview_is_not_installed_and_installs_its_validated_snapshot() {
+        let f = Fixture::new();
+        let preview = FontPreview::open(&f.locations, &f.source).unwrap();
+        let copy = preview.file.path.clone();
+        assert!(copy.is_file());
+        assert!(
+            catalogue(&f.locations)
+                .files
+                .iter()
+                .all(|file| file.path != copy)
+        );
+        assert!(!preview.file.enabled && !preview.file.managed);
+        let alias = preview.file.preview_family(0);
+        assert_eq!(
+            preview_data(&f.locations, &alias).unwrap().unwrap().0,
+            fs::read(&f.source).unwrap()
+        );
+        fs::write(&f.source, b"source changed after opening").unwrap();
+        let font = preview.install(&f.locations).unwrap();
+        assert_eq!(font.digest, preview.file.digest);
+        assert!(font.enabled && font.managed);
+        assert_eq!(
+            preview.install(&f.locations).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        let retained = preview.clone();
+        drop(preview);
+        assert!(copy.is_file());
+        drop(retained);
+        assert!(!copy.exists());
+        assert!(font.path.is_file());
+    }
+
+    #[test]
+    fn document_preview_rejects_invalid_changed_and_excess_copies() {
+        let f = Fixture::new();
+        assert!(FontPreview::from_bytes(&f.locations, &f.source, b"not a font").is_err());
+        assert!(!f.locations.user.as_ref().unwrap().exists());
+        let mut previews = Vec::new();
+        for _ in 0..8 {
+            previews.push(FontPreview::open(&f.locations, &f.source).unwrap());
+        }
+        assert!(FontPreview::open(&f.locations, &f.source).is_err());
+        fs::write(&previews[0].file.path, b"changed").unwrap();
+        assert!(previews[0].install(&f.locations).is_err());
+        drop(previews);
+        assert!(FontPreview::open(&f.locations, &f.source).is_ok());
+    }
+
     #[test]
     fn installation_preserves_original_and_never_replaces_an_existing_font() {
         let f = Fixture::new();

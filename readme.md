@@ -24,6 +24,14 @@ No user-write location is inferred from the host's real font directories.
 `revision` supplies a small cached change token, and exact preview references
 validate the allowed path, file digest and collection index before returning data.
 
+`FontPreview::open` and `from_bytes` accept ordinary files and delegated document
+bytes respectively. They validate before creating a disabled snapshot in the
+reserved `.previews` directory, which discovery skips. The snapshot supports the
+same exact-file alias across processes and is deleted when its last owner drops.
+`FontPreview::install` publishes those exact bytes, without reopening the source.
+Preview storage refuses more than eight files or 128 MiB; crashes can leave
+snapshots behind. Opening alone never changes the font revision or activates a font.
+
 Run `cargo test --manifest-path libraries/fonts/Cargo.toml` from the workspace.
 The original Makefile, fonts.conf and resource installer remain the font-asset
 build pipeline; the Rust API does not download fonts or modify OS-owned fonts.
